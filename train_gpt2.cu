@@ -91,6 +91,13 @@ typedef struct {
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
+    bool use_rope = true; // use RoPE instead of absolute pos embeddings
+    float rope_theta = 10000.0f; // RoPE base frequency
+    float rope_partial_factor = 1.0f; // fraction of head_dim for RoPE (0<..<=1)
+    bool use_gqa = true; // use Grouped Query Attention
+    int n_kv_heads = 4; // number of KV heads (n_heads % n_kv_heads == 0)
+    bool use_swiglu = true; // use SwiGLU in MLP
+    float swiglu_hidden_mult = 2.6666667f; // ~8/3 for param similarity
 } GPT2Config;
 
 // the parameters of the model
@@ -120,19 +127,23 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     size_t C = config.channels;
     size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
+    int head_size = C / config.num_heads;
+    int kv_channels = config.use_gqa ? config.n_kv_heads * head_size : C;
+    int hidden_dim = config.use_swiglu ? (int)(config.swiglu_hidden_mult * C) : 4 * C;
+
     param_sizes[0] = Vp * C; // wte
-    param_sizes[1] = maxT * C; // wpe
+    param_sizes[1] = config.use_rope ? 0 : maxT * C; // wpe (skip if RoPE)
     param_sizes[2] = L * C; // ln1w
     param_sizes[3] = L * C; // ln1b
-    param_sizes[4] = L * (3 * C) * C; // qkvw
-    param_sizes[5] = L * (3 * C); // qkvb
+    param_sizes[4] = L * (C + 2 * kv_channels) * C; // qkvw (adjusted for GQA)
+    param_sizes[5] = L * (C + 2 * kv_channels); // qkvb
     param_sizes[6] = L * C * C; // attprojw
     param_sizes[7] = L * C; // attprojb
     param_sizes[8] = L * C; // ln2w
     param_sizes[9] = L * C; // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = L * C * (4 * C); // fcprojw
+    param_sizes[10] = L * (config.use_swiglu ? 2 * hidden_dim : hidden_dim) * C; // fcw (2x for SwiGLU)
+    param_sizes[11] = L * (config.use_swiglu ? 2 * hidden_dim : hidden_dim); // fcb
+    param_sizes[12] = L * C * hidden_dim; // fcprojw
     param_sizes[13] = L * C; // fcprojb
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
@@ -221,6 +232,9 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
+    int head_size = C / NH;
+    int kv_channels = config.use_gqa ? config.n_kv_heads * head_size : C;
+    int hidden_dim = config.use_swiglu ? (int)(config.swiglu_hidden_mult * C) : 4 * C;
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
     tensors[1] = TENSOR_SPEC(data->ln1,  (recompute < 2) ? L * B * T * C : 0);
@@ -238,19 +252,73 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     tensors[7] = TENSOR_SPEC(data->ln2, (recompute < 2) ? L * B * T * C : 0);
     tensors[8] = TENSOR_SPEC(data->ln2_mean, L * B * T);
     tensors[9] = TENSOR_SPEC(data->ln2_rstd, L * B * T);
-    tensors[10] = TENSOR_SPEC(data->fch, L * B * T * 4*C);
+    tensors[10] = TENSOR_SPEC(data->fch, L * B * T * hidden_dim);
     // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
-    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * 4*C : B * T * 4*C);
+    tensors[11] = TENSOR_SPEC(data->fch_gelu, (recompute < 1) ? L * B * T * hidden_dim : B * T * hidden_dim);
     tensors[12] = TENSOR_SPEC(data->residual3, L * B * T * C);
     tensors[13] = TENSOR_SPEC(data->lnf, B * T * C);
     tensors[14] = TENSOR_SPEC(data->lnf_mean, B * T);
     tensors[15] = TENSOR_SPEC(data->lnf_rstd, B * T);
     tensors[16] = TENSOR_SPEC(data->losses, B * T);
-    tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * 3*C);
-    tensors[18] = TENSOR_SPEC(data->output, B * T * max(3*C, max(NH*T, Vp)));
+    // adding these two compared to the CPU .c code, needed for attention kernel as buffers
+    tensors[17] = TENSOR_SPEC(data->qkvr, L * B * T * (C + 2 * kv_channels));
+    // in inference mode, this buffer will store the logits
+    // in training mode, this buffer will contain the *gradients* of the logits.
+    // during the processing of transformer blocks, we will also use this as a
+    // general scratchpad buffer. Allocation is made large enough to hold (B, T, (C + 2*kv_channels)),
+    // (B, NH, T, T), and (B, T, V) shaped tensors.
+    tensors[18] = TENSOR_SPEC(data->output, B * T * max((C + 2 * kv_channels), max(NH*T, Vp)));
 
-    tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
-    tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
+    // some additional scratch buffers
+    tensors[19] = TENSOR_SPEC(data->scratch_bt4c,   B * T * hidden_dim);
+    tensors[20] = TENSOR_SPEC(data->scratch_btc,    B * T * C);
+}
+
+// SiLU kernel for SwiGLU
+__global__ void silu_forward(floatX* x, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        float val = (float)x[idx];
+        x[idx] = (floatX)(val / (1.0f + expf(-val)));
+    }
+}
+
+// Pointwise multiply for SwiGLU (gate * up)
+__global__ void pointwise_multiply(floatX* a, floatX* b, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        a[idx] = a[idx] * b[idx];
+    }
+}
+
+// Compute RoPE frequencies (cos, sin)
+__global__ void compute_rope_freqs(float* cos, float* sin, int T, float theta, int rope_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * (rope_dim/2)) return;
+    int t = idx / (rope_dim/2);
+    int i = idx % (rope_dim/2);
+    float freq = 1.0f / powf(theta, (float)(2*i) / rope_dim);
+    cos[idx] = cosf(t * freq);
+    sin[idx] = sinf(t * freq);
+}
+
+// Apply RoPE to a tensor (x: B, NH, T, head_dim)
+__global__ void apply_rope(floatX* x, float* cos, float* sin, int head_dim, int rope_dim, int B, int NH, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * NH * T * head_dim) return;
+    int b = idx / (NH * T * head_dim);
+    int h = (idx / (T * head_dim)) % NH;
+    int t = (idx / head_dim) % T;
+    int d = idx % head_dim;
+    if (d >= rope_dim || d % 2 == 1) return; // even dims only, process pairs
+    int d1 = d;
+    int d2 = d + 1;
+    float x1 = (float)x[idx];
+    float x2 = (float)x[idx + (d2 - d1)]; // next dim
+    float cos_val = cos[t * (rope_dim/2) + (d1/2)];
+    float sin_val = sin[t * (rope_dim/2) + (d1/2)];
+    x[idx] = (floatX)(x1 * cos_val - x2 * sin_val);
+    x[idx + (d2 - d1)] = (floatX)(x1 * sin_val + x2 * cos_val);
 }
 
 void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
@@ -660,6 +728,11 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     const size_t L = model->config.num_layers;
     const size_t NH = model->config.num_heads;
     const size_t C = model->config.channels;
+    int head_size = C / NH;
+    int kv_channels = model->config.use_gqa ? model->config.n_kv_heads * head_size : C;
+    int hidden_dim = model->config.use_swiglu ? (int)(model->config.swiglu_hidden_mult * C) : 4 * C;
+    int rope_dim = (int)(head_size * model->config.rope_partial_factor);
+    rope_dim -= rope_dim % 2; // ensure even
 
     // validate B,T are not larger than the values used at initialisation
     // (smaller B,T are okay for inference only)
@@ -677,7 +750,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    // encoding the tokens (with or without wpe for RoPE)
+    encoder_forward(acts.encoded, model->inputs, params.wte, model->config.use_rope ? NULL : params.wpe, B, T, C, main_stream);
 
     // first layernorm isn't fused
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
@@ -688,37 +762,49 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        floatX* l_qkvw = params.qkvw + l * 3*C * C;
-        floatX* l_qkvb = params.qkvb + l * 3*C;
+        floatX* l_qkvw = params.qkvw + l * (C + 2 * kv_channels) * C;
+        floatX* l_qkvb = params.qkvb + l * (C + 2 * kv_channels);
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_attprojb = params.attprojb + l * C;
         floatX* l_ln2w = params.ln2w + l * C;
         floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcb = params.fcb + l * 4*C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
+        floatX* l_fcw = params.fcw + l * (model->config.use_swiglu ? 2 * hidden_dim : hidden_dim) * C;
+        floatX* l_fcb = params.fcb + l * (model->config.use_swiglu ? 2 * hidden_dim : hidden_dim);
+        floatX* l_fcprojw = params.fcprojw + l * C * hidden_dim;
         floatX* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
-        floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
+        floatX* l_qkvr = acts.qkvr + l * B * T * (C + 2 * kv_channels);
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         float* l_ln2_mean = acts.ln2_mean + l * B * T;
         float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch = acts.fch + l * B * T * 4*C;
+        floatX* l_fch = acts.fch + l * B * T * hidden_dim;
         // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
         // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * hidden_dim : acts.fch_gelu;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
         floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
 
         // now do the forward pass
         #ifdef ENABLE_CUDNN
+        // Note: cuDNN may not support GQA/RoPE natively; consider disabling or extending cudnn_att.h
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, (C + 2 * kv_channels), main_stream);
+        if (model->config.use_rope) {
+            // Compute RoPE freqs (reuse ln1_mean for cos/sin as float*)
+            float* cos = acts.ln1_mean;
+            float* sin = cos + T * (rope_dim / 2);
+            compute_rope_freqs<<<CEIL_DIV(T * (rope_dim / 2), 128), 128>>>(cos, sin, T, model->config.rope_theta, rope_dim);
+            // Apply RoPE to Q and K (V unchanged)
+            floatX* q = l_qkvr;
+            floatX* k = l_qkvr + B * T * C;
+            apply_rope<<<CEIL_DIV(B * NH * T * head_size, 128), 128>>>(q, cos, sin, head_size, rope_dim, B, NH, T);
+            apply_rope<<<CEIL_DIV(B * model->config.n_kv_heads * T * head_size, 128), 128>>>(k, cos, sin, head_size, rope_dim, B, model->config.n_kv_heads, T);
+        }
+        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream); // Extend for GQA if needed
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         if (T != model->seq_len) { // unused parts of attention buffer must be zeroed (T-dependent)
@@ -726,14 +812,35 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         }
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, (C + 2 * kv_channels), main_stream);
+        if (model->config.use_rope) {
+            // Compute RoPE freqs (reuse ln1_mean for cos/sin as float*)
+            float* cos = acts.ln1_mean;
+            float* sin = cos + T * (rope_dim / 2);
+            compute_rope_freqs<<<CEIL_DIV(T * (rope_dim / 2), 128), 128>>>(cos, sin, T, model->config.rope_theta, rope_dim);
+            // Apply RoPE to Q and K (V unchanged)
+            floatX* q = scratch;
+            floatX* k = scratch + B * T * C;
+            apply_rope<<<CEIL_DIV(B * NH * T * head_size, 128), 128>>>(q, cos, sin, head_size, rope_dim, B, NH, T);
+            apply_rope<<<CEIL_DIV(B * model->config.n_kv_heads * T * head_size, 128), 128>>>(k, cos, sin, head_size, rope_dim, B, model->config.n_kv_heads, T);
+        }
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, model->config.n_kv_heads, main_stream);
         #endif
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
-        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, (model->config.use_swiglu ? 2 * hidden_dim : hidden_dim), main_stream);
+        if (model->config.use_swiglu) {
+            // SwiGLU: split into gate and up, silu(gate) * up
+            floatX* gate = l_fch;
+            floatX* up = l_fch + B * T * hidden_dim;
+            silu_forward<<<CEIL_DIV(B * T * hidden_dim, 128), 128>>>(gate, B * T * hidden_dim);
+            pointwise_multiply<<<CEIL_DIV(B * T * hidden_dim, 128), 128>>>(gate, up, B * T * hidden_dim); // result in gate
+            matmul_forward_cublaslt(scratch, gate, l_fcprojw, l_fcprojb, B, T, hidden_dim, C, main_stream);
+        } else {
+            matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, hidden_dim, main_stream, l_fch, model->gelu_fusion);
+            matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, hidden_dim, C, main_stream);
+        }
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -753,7 +860,17 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
     cudaCheck(cudaDeviceSynchronize());
 }
-
+// Kernel for repeating KV heads for GQA
+__global__ void repeat_kv(floatX* kv, int B, int T, int head_dim, int n_kv_heads, int n_rep) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * (n_kv_heads * n_rep) * T * head_dim) return;
+    int b = idx / ((n_kv_heads * n_rep) * T * head_dim);
+    int h = (idx / (T * head_dim)) % (n_kv_heads * n_rep);
+    int kv_h = h / n_rep; // map to original KV head
+    int t = (idx / head_dim) % T;
+    int d = idx % head_dim;
+    kv[idx] = kv[b * n_kv_heads * T * head_dim + kv_h * T * head_dim + t * head_dim + d];
+}
 
 // Forwards both the model and the loss and is used for validation splits and evals.
 // In particular it populates cpu_losses with loss at each token.
