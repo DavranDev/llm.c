@@ -824,7 +824,8 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             apply_rope<<<CEIL_DIV(B * NH * T * head_size, 128), 128>>>(q, cos, sin, head_size, rope_dim, B, NH, T);
             apply_rope<<<CEIL_DIV(B * model->config.n_kv_heads * T * head_size, 128), 128>>>(k, cos, sin, head_size, rope_dim, B, model->config.n_kv_heads, T);
         }
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, model->config.n_kv_heads, main_stream);
+
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, model->config.n_kv_heads);
         #endif
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
